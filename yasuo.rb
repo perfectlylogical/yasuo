@@ -31,10 +31,12 @@ require "uri"
 require "thread"
 require 'yaml'
 require 'logger'
+require 'sqlite3'
+require 'fileutils'
 
 require File.dirname(File.realpath(__FILE__)) + '/formloginbrute.rb'
 
-VERSION = '2.1'
+VERSION = '2.3'
 
 class String
   def red; colorize(self, "\e[1m\e[31m"); end
@@ -63,19 +65,24 @@ class MultiDelegator
 end
 
 class Scanner
-  def initialize(paths_filename, nmap_filename, savedURLs_filename, target_ips_range, scan_port_range, scan_all_ports, brute_force_mode, number_of_threads)
+  def initialize(paths_filename, nmap_filename, target_file, savedURLs_filename, target_ips_range, scan_port_range, scan_all_ports, brute_force_mode, number_of_threads)
     #Logger
-    yasuolog = 'yasuo_output_' + Time.now.gmtime.to_s.gsub(/\W/,'') + '.log'
+    FileUtils::mkdir_p 'logs'
+    yasuolog = 'logs/yasuo_output_' + Time.now.strftime('%Y-%m-%d_%H-%M-%S') + '.log'
     $log_file = File.open(yasuolog, "a")
     $logboth = Logger.new MultiDelegator.delegate(:write, :close).to(STDOUT, $log_file)
     $logfile = Logger.new MultiDelegator.delegate(:write, :close).to($log_file)
     $logconsole = Logger.new MultiDelegator.delegate(:write, :close).to(STDOUT)
+    @outdb = 'logs/yasuo_output_' + Time.now.strftime('%Y-%m-%d_%H-%M-%S') + '.db'
 
     # vulnerable applications signatures
     @paths_filename = paths_filename
 
     # nmap XML file
     @nmap_filename = nmap_filename
+    
+    # input file for hosts
+    @target_file = target_file
 
     # File with exploitable URLs saved from last Yasuo run
     @savedURLs_filename = savedURLs_filename
@@ -95,13 +102,22 @@ class Scanner
     #  - both
     @brute_force_mode = brute_force_mode.downcase
 
-    # Number of threads to use with the scanner.
+    # Number of threads to use with the scanner
     @thread_count = number_of_threads
 
-    # stores vulnerable applications that were found
+    # stores discovered vulnerable applications
     @info = [
       ["App Name", "URL to Application", "Potential Exploit", "Username", "Password"]
     ]
+
+    # stores discovered vulnerable applications
+    begin
+      @yasuodb = SQLite3::Database.new @outdb
+      @yasuodb.execute "CREATE TABLE IF NOT EXISTS VulnApps(AppName STRING, AppURL STRING, Exploit STRING, Username STRING, Password STRING)"
+    rescue SQLite3::Exception => e
+      puts "Exception occurred"
+      puts e
+    end
   end
 
   def run
@@ -133,11 +149,15 @@ private
     Nmap::Program.scan do |nmap|
       nmap.syn_scan = true
       nmap.service_scan = true
-      nmap.xml = 'nmap_output_' + Time.now.gmtime.to_s.gsub(/\W/,'') + '.xml'
+      nmap.xml = 'logs/nmap_output_' + Time.now.strftime('%Y-%m-%d_%H-%M-%S') + '.xml'
       nmap.os_fingerprint = false
       nmap.verbose = false
 
-      nmap.targets = @target_ips_range
+      if @target_file.length > 1
+        nmap.target_file = @target_file
+      else
+        nmap.targets = @target_ips_range
+      end
 
       # Logic for determining which ports are to be scanned by the script.
       # TODO: what happens if neither flag is provided? Should we default to
@@ -196,11 +216,12 @@ private
     puts "<<<Yasuo discovered following vulnerable applications>>>".green
     puts "--------------------------------------------------------"
     puts @info.to_table(:first_row_is_head => true)
+    @yasuodb.close
   end
 
   def process_nmap_scan
 
-    urlstatefile = 'savedURLstate' + Time.now.gmtime.to_s.gsub(/\W/,'') + '.out'
+    urlstatefile = 'logs/savedURLstate_' + Time.now.strftime('%Y-%m-%d_%H-%M-%S') + '.out'
     $logboth.info("Using nmap scan output file #{@nmap_filename}")
     @target_urls = []
     @open_ports = 0
@@ -281,7 +302,7 @@ private
         open_port = "#{port.state}" == "open"
 	
 	if "#{port.service}" != ''
-          web_service = ("#{port.service}".include?("http") or "#{port.service}".include?("ssl") or port.service == "websm" or port.service.ssl?)
+          web_service = ("#{port.service}".include?("http") or "#{port.service}".include?("ssl") or "#{port.service}".include?("zeus") or "#{port.service}".include?("blackice") or port.service == "websm" or port.service.ssl?)
           wrapped_service = "#{port.service}".include?("tcpwrapped")
 	end
 
@@ -338,6 +359,7 @@ private
       default_path_2 = @read_sigs[appkey]['path2'].strip
       version_string = @read_sigs[appkey]['vstring'].strip
       exploit_path = @read_sigs[appkey]['exppath'].strip
+      default_creds = @read_sigs[appkey]['defcreds'].strip
 
       target_urls.each_with_index do |url, myindex|
         attack_url = url + default_path_1
@@ -375,7 +397,7 @@ private
               puts "[+] Yasuo found #{appkey} at #{attack_url}. May require form based auth".green
               if @brute_force_mode == 'form' or @brute_force_mode == 'all'
                 $logboth.info("Double-checking if the application implements a login page and initiating login bruteforce, hold on tight...")
-                creds = LoginFormBruteForcer::brute_by_force(attack_url)
+                creds = LoginFormBruteForcer::brute_by_force(attack_url,default_creds)
               else
                 creds = ["N/A", "N/A"]
               end
@@ -395,6 +417,7 @@ private
             end
 
             @info.push([appkey, attack_url, exploit_path, creds[0], creds[1]])
+            @yasuodb.execute("INSERT INTO VulnApps (AppName, AppURL, Exploit, Username, Password) VALUES(?, ?, ?, ?, ?)", appkey, attack_url, exploit_path, creds[0], creds[1])
             #break
 
           when "403"
@@ -406,7 +429,7 @@ private
               puts "[+] Yasuo found #{appkey} at #{attack_url}. Says not authorized but may contain login page".green
               if @brute_force_mode == 'form' or @brute_force_mode == 'all'
                 $logboth.info("Double-checking if the application implements a login page and initiating login bruteforce attack, hold on tight...")
-                creds = LoginFormBruteForcer::brute_by_force(attack_url)
+                creds = LoginFormBruteForcer::brute_by_force(attack_url,default_creds)
               else
                 creds = ["N/A", "N/A"]
               end
@@ -420,6 +443,7 @@ private
               end
             end
             @info.push([appkey, attack_url, exploit_path, creds[0], creds[1]])
+            @yasuodb.execute("INSERT INTO VulnApps (AppName, AppURL, Exploit, Username, Password) VALUES(?, ?, ?, ?, ?)", appkey, attack_url, exploit_path, creds[0], creds[1])
             #break
             
           when "401"
@@ -429,7 +453,7 @@ private
             puts "[+] Yasuo found #{appkey} at #{attack_url}. Requires HTTP basic auth".green
             if @brute_force_mode == 'basic' or @brute_force_mode == 'all'
               $logboth.info("Initiating login bruteforce, hold on tight...")
-              creds = brute_force_basic_auth(attack_url)
+              creds = brute_force_basic_auth(attack_url,default_creds)
             else
               creds = ["N/A", "N/A"]
             end
@@ -442,6 +466,7 @@ private
               end
             end
             @info.push([appkey, attack_url, exploit_path, creds[0], creds[1]])
+            @yasuodb.execute("INSERT INTO VulnApps (AppName, AppURL, Exploit, Username, Password) VALUES(?, ?, ?, ?, ?)", appkey, attack_url, exploit_path, creds[0], creds[1])
             #break
 
           when "404"
@@ -453,8 +478,24 @@ private
   end
 
   # TODO: this is very similar to brute_by_force in formloginbrute.
-  def brute_force_basic_auth(url401)
+  def brute_force_basic_auth(url401,dcreds)
     url = URI.parse(url401)
+
+    #Smart brute-foce starts here
+    puts ("[+] Trying app-specific default creds first -> #{dcreds}\n").green
+    username = dcreds.split(':')[0].chomp
+    password = dcreds.split(':')[1].chomp
+    use_ssl = url.scheme == "https"
+    response = httpGETRequest(url401, :username => username, :password => password, :use_ssl => use_ssl)
+
+    sleep 0.5
+
+    if response and (response.code == "200" or response.code == "301")
+      $logfile.info("[+] Yatta, found default login credentials for #{url401} - #{username}:#{password}\n")
+      puts ("[+] Yatta, found default login credentials for #{url401} - #{username}:#{password}\n").green
+      return username, password
+    end
+    #Smart brute-foce ends here    
 
     LoginFormBruteForcer::usernames_and_passwords.each do |user, pass|
       username, password = user.chomp, pass.chomp
@@ -464,8 +505,8 @@ private
       sleep 0.5
 
       if response and (response.code == "200" or response.code == "301")
-        $logfile.info("[+] Yatta, found default login credentials for #{url401} - #{username} / #{password}\n")
-        puts ("[+] Yatta, found default login credentials for #{url401} - #{username} / #{password}\n").green
+        $logfile.info("[+] Yatta, found default login credentials for #{url401} - #{username}:#{password}\n")
+        puts ("[+] Yatta, found default login credentials for #{url401} - #{username}:#{password}\n").green
         return username, password
       end
     end
@@ -510,7 +551,7 @@ end
 
 if __FILE__ == $0
   puts "#########################################################################################"
-  puts "oooooo   oooo       .o.        .oooooo..o ooooo     ooo   .oooooo.
+  puts "  oooooo   oooo       .o.        .oooooo..o ooooo     ooo   .oooooo.
    `888.   .8'       .888.      d8P'    `Y8 `888'     `8'  d8P'  `Y8b
     `888. .8'       .88888.     Y88bo.       888       8  888      888
      `888.8'       .8' `888.     `ZY8888o.   888       8  888      888
@@ -530,6 +571,7 @@ if __FILE__ == $0
   options.brute = ''
   options.thread_count = 1
   options.paths_file = ''
+  options.target_file = ''
   #options.vomit = false
 
   OptionParser.new do |opts|
@@ -541,6 +583,10 @@ if __FILE__ == $0
 
     opts.on("-f", "--file [FILE]", "Nmap output in xml format") do |file|
       options.nmap_file = file
+    end
+    
+    opts.on("-l", "--inputlist [FILE]", "New line delimited file of IP addresses you wish to scan") do |file|
+      options.target_file = file
     end
 
     opts.on("-u", "--usesavedstate [FILE]", "Use saved good URLs from file") do |file|
@@ -605,8 +651,9 @@ if __FILE__ == $0
 
   end.parse!(ARGV)
 
-  unless options.nmap_file.length > 1 || options.ip_range.length > 1 || options.goodurls_file
-    puts "To perform the Nmap scan, use the option -r to provide the network range.\n"
+  unless options.nmap_file.length > 1 || options.target_file.length > 1  || options.ip_range.length > 1 || options.goodurls_file
+    puts "To perform the Nmap scan, use the option -r to provide the network range or\n"
+    puts "use the option -l to provide the list of IP hosts like nmap -iL.\n"
     puts "Additionally, also provide the port number(s) or choose either option -pA \n"
     puts "to scan all ports or option -pD to scan top 1000 ports.\n\n"
     puts "If you already have an Nmap scan output file in XML format, use -f\n"
@@ -643,6 +690,7 @@ if __FILE__ == $0
   Scanner.new(
     options.paths_file,
     options.nmap_file,
+    options.target_file,
     options.goodurls_file,
     options.ip_range,
     options.port_range,
